@@ -43,10 +43,21 @@ __all__ = [
 # Thread lock for configuration changes
 _config_lock = threading.Lock()
 
-# Module-level state for cloud storage configuration
+# Module-level cloud storage CONFIG (process-global; guarded by _config_lock).
 _cloud_uri: Optional[str] = None
 _client_kwargs: Optional[Dict[str, Any]] = None
-_fs: Optional['fsspec.AbstractFileSystem'] = None
+
+# The cloud filesystem INSTANCE is built PER THREAD, never shared. s3fs/aiobotocore keep a
+# per-instance aiohttp connection pool; a single S3FileSystem shared across worker threads lets
+# two concurrent range-reads interleave response bodies from the pooled connections, so a parquet
+# read can receive bytes belonging to another request and pyarrow aborts the whole process
+# natively (``parquet::ParquetStatusException`` "Index not in dictionary bounds"). Giving each
+# thread its OWN instance isolates the connection pools, so concurrent reads never cross. The
+# generation counter is bumped whenever the config changes so every thread rebuilds against the
+# new config instead of a stale instance.
+_thread_local = threading.local()
+_fs_generation: int = 0
+_UNSET = object()
 
 
 def use_cloud_storage(
@@ -113,13 +124,13 @@ def use_cloud_storage(
         ImportError: If fsspec or required cloud packages are not installed.
         ValueError: If URI format is invalid.
     """
-    global _cloud_uri, _client_kwargs, _fs
+    global _cloud_uri, _client_kwargs, _fs_generation
 
     with _config_lock:
         if disable or uri is None:
             _cloud_uri = None
             _client_kwargs = None
-            _fs = None
+            _fs_generation += 1  # invalidate every thread's cached instance
             return
 
         # Validate and import fsspec
@@ -148,7 +159,7 @@ def use_cloud_storage(
         # Normalize URI to always end with /
         _cloud_uri = uri.rstrip('/') + '/'
         _client_kwargs = client_kwargs or {}
-        _fs = None  # Reset filesystem for lazy initialization
+        _fs_generation += 1  # every thread rebuilds its instance against the new config
 
         # Enable local storage mode since we're using our own storage
         os.environ['EDGAR_USE_LOCAL_DATA'] = '1'
@@ -268,20 +279,20 @@ def get_filesystem() -> Optional['fsspec.AbstractFileSystem']:
     Raises:
         ImportError: If fsspec is not installed but cloud storage is enabled.
     """
-    global _fs
-
-    # Fast path: already initialized
-    if _fs is not None:
-        return _fs
+    # Fast path: this thread already built an instance for the CURRENT config generation.
+    # (_thread_local is per-thread, so this is contention-free; a cached None — local mode —
+    # is a valid result and must be distinguished from "not built yet" via _UNSET.)
+    if getattr(_thread_local, "generation", None) == _fs_generation:
+        cached = getattr(_thread_local, "fs", _UNSET)
+        if cached is not _UNSET:
+            return cached
 
     with _config_lock:
-        # Double-check after acquiring lock
-        if _fs is not None:
-            return _fs
-
+        # Read the process-global config under the lock so it can't change mid-build.
         if _cloud_uri is None:
-            # For local storage, we can use pathlib directly without fsspec
-            # Return None to signal using pathlib operations
+            # Local storage: signal pathlib use. Cache the None for this generation.
+            _thread_local.fs = None
+            _thread_local.generation = _fs_generation
             return None
 
         # Cloud storage requires fsspec
@@ -311,11 +322,16 @@ def get_filesystem() -> Optional['fsspec.AbstractFileSystem']:
             if s3_client_kwargs:
                 kwargs['client_kwargs'] = s3_client_kwargs
 
-        log.debug("Initializing %s filesystem", protocol)
-        _fs = fsspec.filesystem(protocol, **kwargs)
+        # skip_instance_cache defeats fsspec's PROCESS-GLOBAL instance cache, so THIS thread gets
+        # its own S3FileSystem (its own aiobotocore client + aiohttp connection pool) rather than
+        # the one every other thread holds. That isolation is the fix for the concurrent-read
+        # response interleaving that aborted the container in pyarrow. See the _thread_local note.
+        log.debug("Initializing %s filesystem (per-thread)", protocol)
+        fs = fsspec.filesystem(protocol, skip_instance_cache=True, **kwargs)
+        _thread_local.fs = fs
+        _thread_local.generation = _fs_generation
         log.debug("Filesystem initialized successfully")
-
-        return _fs
+        return fs
 
 
 def get_storage_root() -> str:
@@ -341,9 +357,9 @@ def reset_filesystem() -> None:
 
     This function is thread-safe.
     """
-    global _fs
+    global _fs_generation
     with _config_lock:
-        _fs = None
+        _fs_generation += 1  # every thread rebuilds its instance on next access
 
 
 class EdgarPath:
