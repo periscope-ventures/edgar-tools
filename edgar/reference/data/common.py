@@ -39,8 +39,16 @@ def read_parquet_from_package(parquet_filename: str) -> pd.DataFrame:
         package_name = 'edgar.reference.data'
         ref = resources.files(package_name).joinpath(parquet_filename)
         with resources.as_file(ref) as parquet_path:
-            # use_threads=False: serial dictionary decode (no pyarrow thread-pool parallelism).
-            df = pq.read_table(parquet_path, use_threads=False).to_pandas()
+            # use_threads=False: serial decode (no pyarrow thread-pool parallelism). Then
+            # MATERIALIZE every column to plain numpy: ``to_pandas()`` returns pyarrow-backed
+            # columns (ArrowStringArray) regardless of the pandas ``future.infer_string`` option,
+            # and their string/dictionary compute enters pyarrow C++ (GIL released). This frame is
+            # cached and SHARED — ``find_cik`` filters it on every ticker lookup — so concurrent
+            # filters would run pyarrow kernels on the same array at once and abort the process
+            # (``parquet::ParquetStatusException`` "Index not in dictionary bounds" -> ExitError).
+            # numpy-backed columns make concurrent reads of the cached frame pure-Python/GIL-safe.
+            arrow_df = pq.read_table(parquet_path, use_threads=False).to_pandas()
+            df = pd.DataFrame({c: arrow_df[c].to_numpy() for c in arrow_df.columns})
 
         _parquet_cache[parquet_filename] = df
         return df
