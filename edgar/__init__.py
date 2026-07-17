@@ -47,7 +47,6 @@ from edgar.entity.entity_facts import clear_company_facts_cache
 from edgar.files import detect_page_breaks, mark_page_breaks
 from edgar.files.html import Document
 from edgar.filesystem import is_cloud_storage_enabled, sync_to_cloud, use_cloud_storage
-from edgar.warm import warm_caches
 from edgar.financials import Financials, MultiFinancials
 from edgar.funds import Fund, FundClass, FundCompany, FundSeries, find_fund, find_funds
 from edgar.funds.ncen import NCEN_FORMS, FundCensus
